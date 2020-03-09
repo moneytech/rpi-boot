@@ -248,7 +248,7 @@ int method_multiboot(char *args)
 
 		// Skip the pointer to the first item (4 bytes in - structure
 		// starts at offset -4)
-		mbinfo->mmap_addr += 4;
+//		mbinfo->mmap_addr += 4;
 
 		// Now fill in the buffer
 		parse_atag_or_dtb(mem_cb2);
@@ -334,63 +334,72 @@ int method_multiboot(char *args)
 		if(retno != ELF_OK)
 		{
 			free(ehdr);
+			fclose(fp);
+			return retno;
+		}
+		uint8_t *ph_buf;
+		retno = elf32_read_phdrs(fp, ehdr, &ph_buf);
+		if(retno != ELF_OK)
+		{
+			free(sh_buf);
+			free(ehdr);
+			fclose(fp);
 			return retno;
 		}
 
+		entry_addr = ehdr->e_entry;
+
 		// Now interpret and load them
 		//
-		// We do two passes - first loading the sections marked ALLOC to their
+		// We do two passes - first loading the segments from prog headers to their
 		// appropriate addresses, then loading the others (Multiboot requires
 		// we load all sections).  This ensures we don't load the sections not
 		// marked ALLOC to an address that a later section requires.
 
-		for(unsigned int i = 0; i < ehdr->e_shnum; i++)
+		for(unsigned int i = 0; i < ehdr->e_phnum; i++)
 		{
-			Elf32_Shdr *shdr = (Elf32_Shdr *)&sh_buf[i * ehdr->e_shentsize];
+			Elf32_Phdr *phdr = (Elf32_Phdr *)&ph_buf[i * ehdr->e_phentsize];
 
-			if(shdr->sh_flags & SHF_ALLOC)
+			if(phdr->p_type != PT_LOAD)
+				continue;
+
+			uint32_t start = (uint32_t)phdr->p_paddr;
+			uint32_t length = (uint32_t)phdr->p_memsz;
+
+			// Check we can load to this address
+			if(!chunk_get_chunk(start, length))
 			{
+				free(ehdr);
+				free(sh_buf);
+				free(ph_buf);
+				fclose(fp);
+				return retno;
+			}
+
+			// Load the segment
+			retno = elf32_load_segment(fp, phdr);
+			if(retno != ELF_OK)
+			{
+				free(ehdr);
+				free(sh_buf);
+				free(ph_buf);
+				fclose(fp);
+				return retno;
+			}
+
 #ifdef MULTIBOOT_DEBUG
-				printf("MULTIBOOT: section %i is loadable\n", i);
+			printf("MULTIBOOT: segment at %x\n", start);
 #endif
 
-				// Try and allocate space for it
-				if(!shdr->sh_addr)
-				{
-					printf("MULTIBOOT: section %i has no defined "
-							"load address\n", i);
-					free(ehdr);
-					free(sh_buf);
-					return -1;
-				}
-				if(!shdr->sh_size)
-				{
-					printf("MULTIBOOT: section %i has no defined "
-							"size\n", i);
-					free(ehdr);
-					free(sh_buf);
-					return -1;
-				}
-
-				if(!chunk_get_chunk(shdr->sh_addr, shdr->sh_size))
-				{
-					printf("MULTIBOOT: unable to allocate a chunk "
-						"between 0x%08x and 0x%08x for section %i\n",
-						shdr->sh_addr, shdr->sh_addr + shdr->sh_size,
-						i);
-					free(ehdr);
-					free(sh_buf);
-					return -1;
-				}
-
-				// Now load or zero it
-				retno = elf32_load_section(fp, shdr);
-				if(retno != ELF_OK)
-				{
-					free(ehdr);
-					free(sh_buf);
-					return retno;
-				}
+			// Is there an entry point contained within this segment?
+			if(entry_addr >= phdr->p_vaddr &&
+				entry_addr < (phdr->p_vaddr + phdr->p_memsz))
+			{
+				// If so, convert it from a virtual to physical address
+				entry_addr = entry_addr - phdr->p_vaddr + phdr->p_paddr;
+#ifdef MULTIBOOT_DEBUG
+				printf("MULTIBOOT: entry address at physical addr %x\n", entry_addr);
+#endif
 			}
 		}
 
@@ -400,10 +409,6 @@ int method_multiboot(char *args)
 
 			if(!(shdr->sh_flags & SHF_ALLOC))
 			{
-#ifdef MULTIBOOT_DEBUG
-				printf("MULTIBOOT: section %i is not loadable\n", i);
-#endif
-
 				if(shdr->sh_size)
 				{
 					uint32_t load_addr = chunk_get_any_chunk(shdr->sh_size);
@@ -424,6 +429,10 @@ int method_multiboot(char *args)
 						free(sh_buf);
 						return retno;
 					}
+
+#ifdef MULTIBOOT_DEBUG
+					printf("MULTIBOOT: section %i at %x\n", i, load_addr);
+#endif
 				}
 			}
 		}
@@ -435,9 +444,8 @@ int method_multiboot(char *args)
 		mbinfo->u.elf_sec.shndx = ehdr->e_shstrndx;
 		mbinfo->flags |= (1 << 6);
 
-		entry_addr = ehdr->e_entry;
-
 		free(ehdr);
+		free(ph_buf);
 	}
 
 	// Set the cmd line
@@ -454,10 +462,21 @@ int method_multiboot(char *args)
 
 	// Set the fb info
 #ifdef ENABLE_FRAMEBUFFER
-	mbinfo->fb_addr = (uintptr_t)fb_get_framebuffer();
-	mbinfo->fb_size = (fb_get_width() << 16) | (fb_get_height() & 0xffff);
-	mbinfo->fb_pitch = fb_get_pitch();
-	mbinfo->fb_depth = (fb_get_bpp() << 16) | (0x1);	// TODO: check pixel_order
+	mbinfo->framebuffer_addr = (uint32_t)(uintptr_t)fb_get_framebuffer();
+	mbinfo->framebuffer_width = fb_get_width();
+	mbinfo->framebuffer_height = fb_get_height();
+	mbinfo->framebuffer_pitch = fb_get_pitch();
+	mbinfo->framebuffer_bpp = fb_get_bpp();
+	mbinfo->framebuffer_type = MULTIBOOT_FRAMEBUFFER_TYPE_RGB;
+
+	// The following need checking
+	mbinfo->framebuffer_red_field_position = 16;
+	mbinfo->framebuffer_red_mask_size = 8;
+	mbinfo->framebuffer_green_field_position = 8;
+	mbinfo->framebuffer_green_mask_size = 8;
+	mbinfo->framebuffer_blue_field_position = 0;
+	mbinfo->framebuffer_blue_mask_size = 8;
+
 	mbinfo->flags |= (1 << 11);
 #endif
 
@@ -507,6 +526,8 @@ static void add_multiboot_modules()
 		mmod->reserved = 0;
 
 		cur_mod = cur_mod->next;
+
+		mbinfo->flags |= (1<<3);
 	}
 }
 
@@ -519,7 +540,7 @@ int method_module(char *args)
 		name = file;
 
 	// Load a module
-	FILE *fp = fopen(name, "r");
+	FILE *fp = fopen(file, "r");
 	if(!fp)
 	{
 		printf("MODULE: cannot load file %s\n", name);
@@ -700,7 +721,7 @@ int method_kernel(char *args)
 			if(phdr->p_type != PT_LOAD)
 				continue;
 
-			uint32_t start = (uint32_t)phdr->p_vaddr;
+			uint32_t start = (uint32_t)phdr->p_paddr;
 			uint32_t length = (uint32_t)phdr->p_memsz;
 
 			// Check we can load to this address
@@ -804,7 +825,7 @@ int method_console_log(char *args)
 	       logName, bufferSize, bufferSize);
 #endif
 
-	if (NULL == (target = fopen(logName, (is_append) ? "a+" : "w+"))) 
+	if (NULL == (target = fopen(logName, (is_append) ? "a+" : "w+")))
 	{
 		printf("CONSOLE_LOG: cannot open log '%s': errno=%d\n",
 		       logName, errno);
@@ -849,7 +870,7 @@ void mem_cb(uint32_t start, uint32_t size)
 
 void mem_cb2(uint32_t start, uint32_t size)
 {
-	mmap_ptr[0] = 24;	// size of the tag
+	mmap_ptr[0] = 20;	// size of the tag
 	mmap_ptr[1] = start;	// base addr
 	mmap_ptr[2] = 0;	// upper 32 bits of base addr
 	mmap_ptr[3] = size;	// length
